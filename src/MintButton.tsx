@@ -1,52 +1,86 @@
-import { GatewayStatus, useGateway } from "@civic/solana-gateway-react";
-import { CircularProgress } from "@material-ui/core";
-import Button from "@material-ui/core/Button";
-import { CandyMachine } from "@metaplex-foundation/js";
-import { useEffect, useRef, useState } from "react";
 import styled from "styled-components";
+import Button from "@mui/material/Button";
+import { CandyMachineAccount } from "./candy-machine";
+import { CircularProgress } from "@mui/material";
+import { GatewayStatus, useGateway } from "@civic/solana-gateway-react";
+import { useEffect, useState, useRef } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
-import { PublicKey } from "@solana/web3.js";
-
-function usePrevious<T>(value: T): T | undefined {
-  const ref = useRef<T>();
-  useEffect(() => {
-    ref.current = value;
-  }, [value]);
-  return ref.current;
-}
+import {
+  findGatewayToken,
+  getGatewayTokenAddressForOwnerAndGatekeeperNetwork,
+  onGatewayTokenChange,
+  removeAccountChangeListener,
+} from "@identity.com/solana-gateway-ts";
+import { CIVIC_GATEKEEPER_NETWORK } from "./utils";
 
 export const CTAButton = styled(Button)`
-  display: block !important;
-  margin: 0 auto !important;
-  background-color: var(--title-text-color) !important;
-  min-width: 120px !important;
-  font-size: 1em !important;
-`;
+  width: 100%;
+  height: 60px;
+  margin-top: 10px;
+  margin-bottom: 5px;
+  background: linear-gradient(180deg, #604ae5 0%, #813eee 100%);
+  color: white;
+  font-size: 16px;
+  font-weight: bold;
+`; // add your own styles here
 
 export const MintButton = ({
   onMint,
   candyMachine,
   isMinting,
   setIsMinting,
-  isEnded,
   isActive,
-  isSoldOut,
-  limitReached,
-  gatekeeperNetwork
 }: {
-  onMint: (quantityString: number) => Promise<void>;
-  candyMachine: CandyMachine | undefined;
+  onMint: () => Promise<void>;
+  candyMachine?: CandyMachineAccount;
   isMinting: boolean;
   setIsMinting: (val: boolean) => void;
-  isEnded: boolean;
   isActive: boolean;
-  isSoldOut: boolean;
-  limitReached: boolean;
-  gatekeeperNetwork?: PublicKey;
 }) => {
+  const wallet = useWallet();
+  const connection = useConnection();
+  const [verified, setVerified] = useState(false);
   const { requestGatewayToken, gatewayStatus } = useGateway();
-  const [loading, setLoading] = useState(false);
+  const [webSocketSubscriptionId, setWebSocketSubscriptionId] = useState(-1);
+  const [clicked, setClicked] = useState(false);
   const [waitForActiveToken, setWaitForActiveToken] = useState(false);
+
+  const getMintButtonContent = () => {
+    if (candyMachine?.state.isSoldOut) {
+      return "SOLD OUT";
+    } else if (isMinting) {
+      return <CircularProgress />;
+    } else if (
+      candyMachine?.state.isPresale ||
+      candyMachine?.state.isWhitelistOnly
+    ) {
+      return "WHITELIST MINT";
+    }
+
+    return "MINT";
+  };
+
+  useEffect(() => {
+    const mint = async () => {
+      await removeAccountChangeListener(
+        connection.connection,
+        webSocketSubscriptionId
+      );
+      await onMint();
+
+      setClicked(false);
+      setVerified(false);
+    };
+    if (verified && clicked) {
+      mint();
+    }
+  }, [
+    verified,
+    clicked,
+    connection.connection,
+    onMint,
+    webSocketSubscriptionId,
+  ]);
 
   const previousGatewayStatus = usePrevious(gatewayStatus);
   useEffect(() => {
@@ -62,50 +96,86 @@ export const MintButton = ({
       setIsMinting(true);
     }
     console.log("change: ", GatewayStatus[gatewayStatus]);
-  }, [previousGatewayStatus, gatewayStatus, setIsMinting]);
+  }, [waitForActiveToken, previousGatewayStatus, gatewayStatus]);
 
   useEffect(() => {
     if (waitForActiveToken && gatewayStatus === GatewayStatus.ACTIVE) {
       console.log("Minting after token active");
       setWaitForActiveToken(false);
-      onMint(1);
+      onMint();
     }
   }, [waitForActiveToken, gatewayStatus, onMint]);
 
   return (
     <CTAButton
-      disabled={loading || isSoldOut || isMinting || isEnded || !isActive || limitReached}
+      disabled={isMinting || !isActive}
       onClick={async () => {
-        if (isActive && gatekeeperNetwork) {
-          if (gatewayStatus === GatewayStatus.ACTIVE) {
-            await onMint(1);
+        if (candyMachine?.state.isActive && candyMachine?.state.gatekeeper) {
+          const network =
+            candyMachine.state.gatekeeper.gatekeeperNetwork.toBase58();
+          if (network === CIVIC_GATEKEEPER_NETWORK) {
+            if (gatewayStatus === GatewayStatus.ACTIVE) {
+              await onMint();
+            } else {
+              // setIsMinting(true);
+              setWaitForActiveToken(true);
+              await requestGatewayToken();
+              console.log("after: ", gatewayStatus);
+            }
+          } else if (
+            network === "ttib7tuX8PTWPqFsmUFQTj78MbRhUmqxidJRDv4hRRE" ||
+            network === "tibePmPaoTgrs929rWpu755EXaxC7M3SthVCf6GzjZt"
+          ) {
+            setClicked(true);
+            const gatewayToken = await findGatewayToken(
+              connection.connection,
+              wallet.publicKey!,
+              candyMachine.state.gatekeeper.gatekeeperNetwork
+            );
+
+            if (gatewayToken?.isValid()) {
+              await onMint();
+            } else {
+              window.open(
+                `https://verify.encore.fans/?gkNetwork=${network}`,
+                "_blank"
+              );
+
+              const gatewayTokenAddress =
+                await getGatewayTokenAddressForOwnerAndGatekeeperNetwork(
+                  wallet.publicKey!,
+                  candyMachine.state.gatekeeper.gatekeeperNetwork
+                );
+
+              setWebSocketSubscriptionId(
+                onGatewayTokenChange(
+                  connection.connection,
+                  gatewayTokenAddress,
+                  () => setVerified(true),
+                  "confirmed"
+                )
+              );
+            }
           } else {
-            setWaitForActiveToken(true);
-            await requestGatewayToken();
+            setClicked(false);
+            throw new Error(`Unknown Gatekeeper Network: ${network}`);
           }
         } else {
-          await onMint(1);
+          await onMint();
+          setClicked(false);
         }
       }}
       variant="contained"
     >
-      {!candyMachine ? (
-        "CONNECTING..."
-      ) : isSoldOut ? (
-        "SOLD OUT"
-      ) : limitReached ? (
-        "LIMIT REACHED"
-      ) : isActive ? (
-        isMinting || loading ? (
-          <CircularProgress />
-        ) : (
-          "MINT"
-        )
-      ) : isEnded ? (
-        "ENDED"
-      ) : (
-        "UNAVAILABLE"
-      )}
+      {getMintButtonContent()}
     </CTAButton>
   );
 };
+
+function usePrevious<T>(value: T): T | undefined {
+  const ref = useRef<T>();
+  useEffect(() => {
+    ref.current = value;
+  }, [value]);
+  return ref.current;
+}
